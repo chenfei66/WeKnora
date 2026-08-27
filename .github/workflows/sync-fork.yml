@@ -1,0 +1,94 @@
+# 工作流名称
+name: Sync Fork
+
+# 执行条件
+on:
+  # 每天 UTC 02:17 自动执行
+  schedule:
+    - cron: "17 2 * * *"
+
+  # 允许在 Actions 页面手动执行
+  workflow_dispatch:
+
+# 允许工作流更新当前仓库
+permissions:
+  contents: write
+
+# 防止多个同步任务同时运行
+concurrency:
+  group: sync-fork
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync upstream repository
+    runs-on: ubuntu-latest
+
+    steps:
+      # 下载当前 Fork 仓库的完整代码和提交记录
+      - name: Checkout fork repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # 自动识别当前 Fork、原始仓库及双方默认分支
+      - name: Detect fork and upstream repository
+        id: repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IS_FORK="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.fork')"
+          FORK_BRANCH="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.default_branch')"
+          UPSTREAM_REPO="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.parent.full_name // empty')"
+          UPSTREAM_BRANCH="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.parent.default_branch // empty')"
+
+          if [ "${IS_FORK}" != "true" ]; then
+            echo "::error::当前仓库不是 GitHub Fork，无法定位原始仓库。"
+            exit 1
+          fi
+
+          if [ -z "${UPSTREAM_REPO}" ] || [ -z "${UPSTREAM_BRANCH}" ]; then
+            echo "::error::未能识别原始仓库或默认分支。"
+            exit 1
+          fi
+
+          echo "fork_branch=${FORK_BRANCH}" >> "${GITHUB_OUTPUT}"
+          echo "upstream_repo=${UPSTREAM_REPO}" >> "${GITHUB_OUTPUT}"
+          echo "upstream_branch=${UPSTREAM_BRANCH}" >> "${GITHUB_OUTPUT}"
+
+          echo "当前 Fork：${GITHUB_REPOSITORY}"
+          echo "Fork 默认分支：${FORK_BRANCH}"
+          echo "原始仓库：${UPSTREAM_REPO}"
+          echo "上游默认分支：${UPSTREAM_BRANCH}"
+
+      # 将上游最新代码合并到当前 Fork
+      - name: Merge upstream changes
+        env:
+          FORK_BRANCH: ${{ steps.repository.outputs.fork_branch }}
+          UPSTREAM_REPO: ${{ steps.repository.outputs.upstream_repo }}
+          UPSTREAM_BRANCH: ${{ steps.repository.outputs.upstream_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+
+          git fetch origin "${FORK_BRANCH}"
+          git fetch upstream --prune
+          git checkout "${FORK_BRANCH}"
+
+          git merge --no-edit "upstream/${UPSTREAM_BRANCH}"
+
+          if git diff --quiet "origin/${FORK_BRANCH}..${FORK_BRANCH}"; then
+            echo "当前 Fork 已经是最新版本，无需推送。"
+          else
+            git push origin "${FORK_BRANCH}"
+            echo "Fork 仓库同步完成。"
+          fi
