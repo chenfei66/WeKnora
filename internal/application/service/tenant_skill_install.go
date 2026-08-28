@@ -72,10 +72,30 @@ func (s *TenantSkillService) InstallSkill(
 		return "", err
 	}
 	if s.canSkipInstall(ctx, existing, bundle) {
+		catalog, catalogErr := s.upsertCatalogFromBundle(ctx, tenantID, bundle, archive, false)
+		if catalogErr != nil {
+			return "", fmt.Errorf("record skill catalog: %w", catalogErr)
+		}
 		if err := s.refreshSkippedBundle(ctx, existing, archive); err != nil {
 			return "", fmt.Errorf("store bundle for skill %s: %w", existing.ID, err)
 		}
+		if catalog != nil && existing.CatalogID != catalog.ID {
+			if err := s.updateSkillFields(ctx, tenantID, configID, existing.ID, func(e *types.TenantSkillEntity) {
+				e.CatalogID = catalog.ID
+			}); err != nil {
+				return "", err
+			}
+		}
 		return existing.ID, nil
+	}
+
+	catalog, err := s.upsertCatalogFromBundle(ctx, tenantID, bundle, archive, false)
+	if err != nil {
+		return "", fmt.Errorf("record skill catalog: %w", err)
+	}
+	catalogID := ""
+	if catalog != nil {
+		catalogID = catalog.ID
 	}
 
 	skillID := uuid.NewString()
@@ -83,13 +103,15 @@ func (s *TenantSkillService) InstallSkill(
 	if existing != nil {
 		skillID = existing.ID
 		takeSkillRowForInstall(existing, bundle, now)
+		existing.CatalogID = catalogID
 		if err := s.skills.UpdateSkill(ctx, existing); err != nil {
 			return "", err
 		}
 	} else {
 		if err := s.skills.CreateSkill(ctx, &types.TenantSkillEntity{
 			ID: skillID, TenantID: tenantID, SandboxConfigID: configID,
-			Name: bundle.Name, Version: bundle.Version,
+			CatalogID: catalogID,
+			Name:      bundle.Name, Version: bundle.Version,
 			Description: bundle.Description, Instructions: bundle.Instructions,
 			BundleSHA256: bundle.SHA256, Enabled: true,
 			Status: types.SkillStatusInstalling, InstallingSince: &now,
@@ -108,6 +130,7 @@ func (s *TenantSkillService) InstallSkill(
 			}
 			skillID = winner.ID
 			takeSkillRowForInstall(winner, bundle, now)
+			winner.CatalogID = catalogID
 			if err := s.skills.UpdateSkill(ctx, winner); err != nil {
 				return "", err
 			}
@@ -1476,6 +1499,9 @@ Hard requirements:
   a value you invent would be stored as this workspace's real credential. If one environment
   variable is required, set required to true; if it is optional, set required to false. If the
   skill needs no environment variables, write {"env":[]}.
+  Do not declare WEKNORA_SKILL_DIR, WEKNORA_SKILL_OUTPUT_DIR, WEKNORA_SKILL_HISTORY_ROOT or
+  WEKNORA_SESSION_INPUT_DIR: the sandbox injects those. Other WEKNORA_* names the skill reads
+  (WEKNORA_API_KEY, WEKNORA_BASE_URL, WEKNORA_HOST, WEKNORA_TOKEN, WEKNORA_KB_ID) MUST be declared.
 
 The server verifies the result itself before the image is kept, so report what
 you did rather than whether it passed. Verification parses every script with
