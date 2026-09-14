@@ -1,75 +1,42 @@
-# 工作流名称
-name: Sync Fork
+name: Sync Upstream
 
-# 执行条件
 on:
-  # 每天 UTC 02:17 自动执行
   schedule:
-    - cron: "17 2 * * *"
+    # 沿用北京时间：每周一凌晨 03:17 执行一次
+    - cron: "17 3 * * 1"
+      timezone: "Asia/Shanghai"
 
-  # 允许在 Actions 页面手动执行
+  # 保留 Actions 页面上的手动执行按钮
   workflow_dispatch:
 
-# 允许工作流更新当前仓库
 permissions:
   contents: write
 
-# 防止多个同步任务同时运行
 concurrency:
-  group: sync-fork
+  group: sync-upstream
+  # 不因重复点击而取消正在执行的同步
   cancel-in-progress: false
 
 jobs:
   sync:
-    name: Sync upstream repository
     runs-on: ubuntu-latest
+    # 整个任务最多运行 15 分钟，防止网络卡住
+    timeout-minutes: 15
 
     steps:
-      # 下载当前 Fork 仓库的完整代码和提交记录
-      - name: Checkout fork repository
-        uses: actions/checkout@v6
+      - name: 获取 Fork 仓库
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
 
-      # 自动识别当前 Fork、原始仓库及双方默认分支
-      - name: Detect fork and upstream repository
-        id: repository
+      - name: 同步上游，最多尝试 3 次
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          IS_FORK="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.fork')"
-          FORK_BRANCH="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.default_branch')"
-          UPSTREAM_REPO="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.parent.full_name // empty')"
-          UPSTREAM_BRANCH="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.parent.default_branch // empty')"
-
-          if [ "${IS_FORK}" != "true" ]; then
-            echo "::error::当前仓库不是 GitHub Fork，无法定位原始仓库。"
-            exit 1
-          fi
-
-          if [ -z "${UPSTREAM_REPO}" ] || [ -z "${UPSTREAM_BRANCH}" ]; then
-            echo "::error::未能识别原始仓库或默认分支。"
-            exit 1
-          fi
-
-          echo "fork_branch=${FORK_BRANCH}" >> "${GITHUB_OUTPUT}"
-          echo "upstream_repo=${UPSTREAM_REPO}" >> "${GITHUB_OUTPUT}"
-          echo "upstream_branch=${UPSTREAM_BRANCH}" >> "${GITHUB_OUTPUT}"
-
-          echo "当前 Fork：${GITHUB_REPOSITORY}"
-          echo "Fork 默认分支：${FORK_BRANCH}"
-          echo "原始仓库：${UPSTREAM_REPO}"
-          echo "上游默认分支：${UPSTREAM_BRANCH}"
-
-      # 将上游最新代码合并到当前 Fork
-      - name: Merge upstream changes
-        env:
-          FORK_BRANCH: ${{ steps.repository.outputs.fork_branch }}
-          UPSTREAM_REPO: ${{ steps.repository.outputs.upstream_repo }}
-          UPSTREAM_BRANCH: ${{ steps.repository.outputs.upstream_branch }}
+          FORK_BRANCH: ${{ github.event.repository.default_branch }}
+          MAX_ATTEMPTS: "3"   # 包含首次执行，即最多再重试 2 次
+          RETRY_DELAY: "30"   # 两次尝试之间等待 30 秒
+          GIT_TERMINAL_PROMPT: "0"
         shell: bash
         run: |
           set -euo pipefail
@@ -77,18 +44,76 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git remote remove upstream 2>/dev/null || true
-          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          # 返回值：0=成功；1=可以重试；2=停止本轮同步
+          sync_once() {
+            local upstream_repo upstream_branch
 
-          git fetch origin "${FORK_BRANCH}"
-          git fetch upstream --prune
-          git checkout "${FORK_BRANCH}"
+            # 自动识别原项目及其默认分支，不需要手动填写
+            upstream_repo="$(gh api "repos/${GITHUB_REPOSITORY}" \
+              --jq '.parent.full_name // empty')" || return 1
 
-          git merge --no-edit "upstream/${UPSTREAM_BRANCH}"
+            if [[ -z "$upstream_repo" ]]; then
+              echo "::warning::未找到父仓库，请确认当前仓库仍是 Fork。"
+              return 2
+            fi
 
-          if git diff --quiet "origin/${FORK_BRANCH}..${FORK_BRANCH}"; then
-            echo "当前 Fork 已经是最新版本，无需推送。"
-          else
-            git push origin "${FORK_BRANCH}"
-            echo "Fork 仓库同步完成。"
-          fi
+            upstream_branch="$(gh api "repos/${upstream_repo}" \
+              --jq '.default_branch // empty')" || return 1
+
+            if [[ -z "$upstream_branch" ]]; then
+              echo "::warning::未找到上游默认分支。"
+              return 2
+            fi
+
+            echo "同步：${upstream_repo}:${upstream_branch} -> ${GITHUB_REPOSITORY}:${FORK_BRANCH}"
+
+            # 每次重试前重新读取 Fork 的最新状态
+            git fetch --no-tags origin \
+              "+refs/heads/${FORK_BRANCH}:refs/remotes/origin/${FORK_BRANCH}" || return 1
+
+            # 只重置 Actions 临时工作区到自己的 Fork 最新版本
+            # 不会重置远端仓库，也不是强制覆盖为上游版本
+            git reset --hard "refs/remotes/origin/${FORK_BRANCH}" || return 1
+
+            git fetch --no-tags "${GITHUB_SERVER_URL}/${upstream_repo}.git" \
+              "refs/heads/${upstream_branch}" || return 1
+
+            # 保留自己的提交；合并失败不强行覆盖，也不反复尝试
+            if ! git merge --no-edit FETCH_HEAD; then
+              git merge --abort 2>/dev/null || true
+              echo "::warning::无法自动合并，请检查冲突或其他合并错误；本轮停止。"
+              return 2
+            fi
+
+            # 普通推送，绝不使用 --force
+            git push origin "HEAD:refs/heads/${FORK_BRANCH}" || return 1
+          }
+
+          attempt=0
+          while (( attempt < MAX_ATTEMPTS )); do
+            attempt=$((attempt + 1))
+            echo "===== 第 ${attempt}/${MAX_ATTEMPTS} 次同步尝试 ====="
+
+            if sync_once; then
+              echo "同步成功：第 ${attempt} 次尝试完成。" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            else
+              rc=$?
+            fi
+
+            # 冲突等需要人工处理的问题，提前停止
+            if (( rc == 2 )); then
+              break
+            fi
+
+            # 最后一次失败后不再等待、不再重试
+            if (( attempt < MAX_ATTEMPTS )); then
+              echo "本次失败，${RETRY_DELAY} 秒后重试。"
+              sleep "$RETRY_DELAY"
+            fi
+          done
+
+          echo "同步未完成：本轮已尝试 ${attempt} 次，停止执行。下一次自动运行在下周。" \
+            >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::本轮同步失败，已停止；不会自动重新运行整个工作流。"
+          exit 1
